@@ -261,6 +261,47 @@ check('a session-level filter narrows every pipe that shares the scope', () => {
     assert.ok(data.every(r => r.visits === 1));
 });
 
+check('a store created before event_id existed still opens, keeping its hits', () => {
+    // Production had a database in exactly this shape. Declaring the index
+    // alongside the table is not enough: CREATE TABLE IF NOT EXISTS is a no-op
+    // against an existing database, so the index would be built on a column
+    // that only the migration is about to add — and the process would die at
+    // startup rather than degrade.
+    const oldDir = fs.mkdtempSync(path.join(os.tmpdir(), 'store-old-'));
+    const oldPath = path.join(oldDir, 'legacy.db');
+    const {DatabaseSync} = require('node:sqlite');
+    const legacy = new DatabaseSync(oldPath);
+    legacy.exec(`CREATE TABLE hits (
+        id INTEGER PRIMARY KEY, site_uuid TEXT NOT NULL, timestamp INTEGER NOT NULL,
+        session_id TEXT NOT NULL, action TEXT NOT NULL DEFAULT 'page_hit',
+        version TEXT NOT NULL DEFAULT '1', member_uuid TEXT NOT NULL DEFAULT '',
+        member_status TEXT NOT NULL DEFAULT '', post_uuid TEXT NOT NULL DEFAULT '',
+        post_type TEXT NOT NULL DEFAULT '', gift_link TEXT NOT NULL DEFAULT '',
+        location TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
+        pathname TEXT NOT NULL DEFAULT '', href TEXT NOT NULL DEFAULT '',
+        device TEXT NOT NULL DEFAULT 'unknown', os TEXT NOT NULL DEFAULT 'Unknown',
+        browser TEXT NOT NULL DEFAULT 'Unknown', utm_source TEXT NOT NULL DEFAULT '',
+        utm_medium TEXT NOT NULL DEFAULT '', utm_campaign TEXT NOT NULL DEFAULT '',
+        utm_term TEXT NOT NULL DEFAULT '', utm_content TEXT NOT NULL DEFAULT ''
+    )`);
+    legacy.prepare(`INSERT INTO hits (site_uuid, timestamp, session_id, pathname)
+        VALUES (?,?,?,?)`).run(SITE, Math.floor(Date.parse('2026-08-01T10:00:00Z') / 1000), 'legacy-1', '/ancien/');
+    legacy.close();
+
+    const migrated = openStore(oldPath);
+    const {data} = migrated.query('api_top_pages', {
+        site_uuid: SITE, date_from: '2026-08-01', date_to: '2026-08-01', timezone: 'Etc/UTC'
+    });
+    assert.deepStrictEqual(data, [{post_uuid: '', pathname: '/ancien/', visits: 1}], 'the existing hit survives');
+    // And the migrated store must accept new events with an event_id.
+    assert.strictEqual(migrated.record({
+        timestamp: '2026-08-01T11:00:00Z', session_id: 'legacy-2', action: 'page_hit', version: '1',
+        payload: {site_uuid: SITE, pathname: '/apres/', event_id: 'evt-after-migration'}
+    }), true);
+    migrated.close();
+    fs.rmSync(oldDir, {recursive: true, force: true});
+});
+
 /* --- importing history from a Tinybird export ---------------------------- */
 
 // One row exactly as `analytics_events` exports it: payload as a JSON string,

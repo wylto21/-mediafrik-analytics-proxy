@@ -60,9 +60,10 @@ CREATE TABLE IF NOT EXISTS hits (
     -- browser retries a request the server had in fact received.
     event_id      TEXT    NOT NULL DEFAULT ''
 );
--- Partial, so the many rows that carry no event_id do not collide with each
--- other on the empty string.
-CREATE UNIQUE INDEX IF NOT EXISTS hits_event_id ON hits (event_id) WHERE event_id != '';
+-- The index on event_id is NOT declared here. This block runs against databases
+-- created before that column existed, where CREATE TABLE IF NOT EXISTS is a
+-- no-op and the index would then fail on a column that is not there yet. It is
+-- created after the migration below instead.
 -- Every pipe filters on (site_uuid, timestamp) first; the session index serves
 -- the group-by that rebuilds sessions on read.
 CREATE INDEX IF NOT EXISTS hits_site_ts  ON hits (site_uuid, timestamp);
@@ -807,12 +808,15 @@ function openStore(filePath) {
     db.exec(SCHEMA);
 
     // A store created before event_id existed is still out there holding real
-    // hits; add the column rather than asking anyone to start over.
+    // hits; add the column rather than asking anyone to start over. This must
+    // happen before the index is declared, not after.
     const columns = db.prepare('PRAGMA table_info(hits)').all().map(c => c.name);
     if (!columns.includes('event_id')) {
         db.exec('ALTER TABLE hits ADD COLUMN event_id TEXT NOT NULL DEFAULT \'\'');
-        db.exec('CREATE UNIQUE INDEX IF NOT EXISTS hits_event_id ON hits (event_id) WHERE event_id != \'\'');
     }
+    // Partial, so the rows carrying no event_id do not collide with each other
+    // on the empty string.
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS hits_event_id ON hits (event_id) WHERE event_id != \'\'');
 
     // OR IGNORE rather than a plain INSERT: a replayed event_id is a duplicate
     // to skip, not an error to raise.
