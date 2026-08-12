@@ -13,3 +13,6 @@
 
 *.log
 node_modules/
+
+# Exported analytics history — visitor data, not source.
+*.ndjson

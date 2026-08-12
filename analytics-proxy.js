@@ -516,6 +516,69 @@ function servePipe(req, res) {
     res.end(JSON.stringify(result));
 }
 
+/**
+ * Bulk import of history, as NDJSON in the shape a Tinybird `analytics_events`
+ * export produces: one `{timestamp, session_id, action, version, payload}` per
+ * line, `payload` being a JSON string.
+ *
+ * This exists because replaying history through the tracker endpoint would be
+ * wrong: that path derives `session_id` from the caller's IP and user agent, so
+ * every imported hit would collapse into a single session belonging to whoever
+ * ran the import. Here the original session_id is preserved, which is what
+ * makes visit counts survive the move.
+ *
+ * Authenticated with the JWT signing secret rather than the static bearer: this
+ * writes, and the static token is regenerated at boot in a container, so nobody
+ * would know it. Re-running is safe — `event_id` makes inserts idempotent.
+ */
+function serveImport(req, res) {
+    const auth = String(req.headers.authorization || '');
+    const presented = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+    const secret = Buffer.from(ADMIN_TOKEN);
+    const given = Buffer.from(presented);
+    if (!ADMIN_TOKEN || given.length !== secret.length || !crypto.timingSafeEqual(given, secret)) {
+        console.error('[import] refused — wrong or missing secret');
+        res.writeHead(403, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({error: 'invalid token'}));
+        return;
+    }
+
+    let raw = '';
+    let tooBig = false;
+    req.on('data', (chunk) => {
+        raw += chunk;
+        // Import in batches rather than one enormous request.
+        if (raw.length > 32 * 1024 * 1024) {
+            tooBig = true;
+            req.destroy();
+        }
+    });
+    req.on('end', () => {
+        if (tooBig) {
+            return;
+        }
+        let imported = 0;
+        let duplicates = 0;
+        let rejected = 0;
+
+        for (const line of raw.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed) {
+                continue;
+            }
+            try {
+                store.record(JSON.parse(trimmed)) ? imported++ : duplicates++;
+            } catch (err) {
+                rejected++;
+            }
+        }
+
+        console.log(`[import] ${imported} imported, ${duplicates} already present, ${rejected} rejected`);
+        res.writeHead(200, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({imported, duplicates, rejected, store: store.stats()}));
+    });
+}
+
 const server = http.createServer((req, res) => {
     cors(res);
 
@@ -541,6 +604,10 @@ const server = http.createServer((req, res) => {
     // Tinybird answers pipes on both verbs; the Admin posts, Ghost's server-side
     // stats service gets. Drain the body on POST — the Admin puts every
     // parameter in the query string, but an unread stream keeps the socket open.
+    if (store && req.method === 'POST' && req.url.startsWith('/v0/import')) {
+        serveImport(req, res);
+        return;
+    }
     if (store && (req.method === 'GET' || req.method === 'POST') && req.url.startsWith('/v0/pipes/')) {
         if (req.method === 'POST') {
             req.resume();

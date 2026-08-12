@@ -87,3 +87,25 @@ Covers the pipe semantics that are easy to get wrong: a session counts in the
 bucket of its first pageview (with all of its pageviews), a `pathname` filter
 switches `pageviews` to a per-hit count, per-post and gift-link totals ignore the
 date range, and a day is 23 hours long across a spring-forward boundary.
+
+## Importing history from Tinybird
+
+Export the events for one site, then push them into the store:
+
+```bash
+curl -s -G https://api.<region>.tinybird.co/v0/sql \
+  --data-urlencode "q=SELECT timestamp, session_id, action, version, payload \
+      FROM analytics_events WHERE site_uuid='<uuid>' ORDER BY timestamp FORMAT JSONEachRow" \
+  -H "Authorization: Bearer $TB_ADMIN_TOKEN" -o history.ndjson
+
+STATS_JWT_SECRET=… node import-history.js history.ndjson https://<domain>/_analytics
+```
+
+`POST /v0/import` takes that NDJSON directly and is authenticated with
+`STATS_JWT_SECRET`. Do **not** replay history through the tracker endpoint: that
+path derives `session_id` from the caller's IP and user agent, so every imported
+hit would collapse into one session and visit counts would be destroyed.
+
+Re-running is safe. Each hit carries the tracker's `event_id`, which a partial
+unique index makes idempotent — a failed import can simply be repeated, and a
+duplicate already present in the source is collapsed rather than counted twice.

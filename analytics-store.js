@@ -54,8 +54,15 @@ CREATE TABLE IF NOT EXISTS hits (
     utm_medium    TEXT    NOT NULL DEFAULT '',
     utm_campaign  TEXT    NOT NULL DEFAULT '',
     utm_term      TEXT    NOT NULL DEFAULT '',
-    utm_content   TEXT    NOT NULL DEFAULT ''
+    utm_content   TEXT    NOT NULL DEFAULT '',
+    -- The tracker mints one per hit. It is what makes re-importing history
+    -- idempotent, and it also guards against a hit being counted twice if the
+    -- browser retries a request the server had in fact received.
+    event_id      TEXT    NOT NULL DEFAULT ''
 );
+-- Partial, so the many rows that carry no event_id do not collide with each
+-- other on the empty string.
+CREATE UNIQUE INDEX IF NOT EXISTS hits_event_id ON hits (event_id) WHERE event_id != '';
 -- Every pipe filters on (site_uuid, timestamp) first; the session index serves
 -- the group-by that rebuilds sessions on read.
 CREATE INDEX IF NOT EXISTS hits_site_ts  ON hits (site_uuid, timestamp);
@@ -176,6 +183,21 @@ function browserFrom(userAgent) {
 }
 
 const str = value => (value === undefined || value === null ? '' : String(value));
+
+/**
+ * Unix seconds from either an ISO instant or ClickHouse's `YYYY-MM-DD HH:MM:SS`.
+ *
+ * The live tracker sends ISO with a `Z`; a Tinybird export sends the second
+ * form, which carries no zone marker even though it is UTC. `new Date()` reads
+ * that as *local* time, so importing history on a server outside UTC would
+ * silently shift every event by the offset — visits landing on the wrong day.
+ */
+function toUnixSeconds(value) {
+    const raw = str(value).trim();
+    const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?$/.exec(raw);
+    const ms = new Date(m ? `${m[1]}T${m[2]}${m[3] || ''}Z` : raw).getTime();
+    return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
 
 /* ------------------------------------------------------------------ *
  * Time bucketing
@@ -784,12 +806,22 @@ function openStore(filePath) {
     db.exec('PRAGMA busy_timeout = 5000');
     db.exec(SCHEMA);
 
-    const insert = db.prepare(`INSERT INTO hits (
+    // A store created before event_id existed is still out there holding real
+    // hits; add the column rather than asking anyone to start over.
+    const columns = db.prepare('PRAGMA table_info(hits)').all().map(c => c.name);
+    if (!columns.includes('event_id')) {
+        db.exec('ALTER TABLE hits ADD COLUMN event_id TEXT NOT NULL DEFAULT \'\'');
+        db.exec('CREATE UNIQUE INDEX IF NOT EXISTS hits_event_id ON hits (event_id) WHERE event_id != \'\'');
+    }
+
+    // OR IGNORE rather than a plain INSERT: a replayed event_id is a duplicate
+    // to skip, not an error to raise.
+    const insert = db.prepare(`INSERT OR IGNORE INTO hits (
         site_uuid, timestamp, session_id, action, version,
         member_uuid, member_status, post_uuid, post_type, gift_link,
         location, source, pathname, href, device, os, browser,
-        utm_source, utm_medium, utm_campaign, utm_term, utm_content
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+        utm_source, utm_medium, utm_campaign, utm_term, utm_content, event_id
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
     return {
         /**
@@ -797,17 +829,27 @@ function openStore(filePath) {
          * transformation, done once at write time instead of on every read.
          */
         record(event) {
-            const payload = event.payload && typeof event.payload === 'object' ? event.payload : {};
+            // Tinybird stores the payload as a JSON string, so an event coming
+            // back from an export arrives in that shape rather than as an object.
+            let payload = event.payload;
+            if (typeof payload === 'string') {
+                try {
+                    payload = JSON.parse(payload);
+                } catch (err) {
+                    payload = {};
+                }
+            }
+            payload = payload && typeof payload === 'object' ? payload : {};
             const ua = payload['user-agent'] || '';
-            const seconds = Math.floor(new Date(event.timestamp).getTime() / 1000);
-            if (!Number.isFinite(seconds)) {
-                return;
+            const seconds = toUnixSeconds(event.timestamp);
+            if (seconds === null) {
+                return false;
             }
             // mv_hits falls back to payload.meta.referrerSource when the
             // top-level one is empty; the proxy sets both, but a hit relayed
             // from elsewhere may only carry the nested copy.
             const referrer = str(payload.referrerSource) || str(payload.meta && payload.meta.referrerSource);
-            insert.run(
+            const result = insert.run(
                 str(payload.site_uuid),
                 seconds,
                 str(event.session_id) || '0',
@@ -829,8 +871,12 @@ function openStore(filePath) {
                 str(payload.utm_medium),
                 str(payload.utm_campaign),
                 str(payload.utm_term),
-                str(payload.utm_content)
+                str(payload.utm_content),
+                str(payload.event_id)
             );
+            // False means the event_id was already present — the caller is
+            // replaying history it has already imported.
+            return result.changes > 0;
         },
 
         /**

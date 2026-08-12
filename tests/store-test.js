@@ -261,6 +261,59 @@ check('a session-level filter narrows every pipe that shares the scope', () => {
     assert.ok(data.every(r => r.visits === 1));
 });
 
+/* --- importing history from a Tinybird export ---------------------------- */
+
+// One row exactly as `analytics_events` exports it: payload as a JSON string,
+// and a timestamp with no zone marker even though it is UTC.
+const exported = {
+    timestamp: '2026-08-04 09:00:23',
+    session_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    action: 'page_hit',
+    version: '1',
+    payload: JSON.stringify({
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/145',
+        location: 'IS', pathname: '/imported/', href: 'https://x/imported/',
+        site_uuid: SITE, post_uuid: 'undefined', member_status: 'undefined',
+        gift_link: '', device: 'desktop', referrerSource: '',
+        event_id: 'evt-0001'
+    })
+};
+
+check('an exported row imports with its payload still a string', () => {
+    assert.strictEqual(store.record(exported), true);
+    const {data} = store.query('api_top_pages', {
+        site_uuid: SITE, date_from: '2026-08-04', date_to: '2026-08-04', timezone: 'Etc/UTC'
+    });
+    assert.deepStrictEqual(data, [{post_uuid: '', pathname: '/imported/', visits: 1}]);
+});
+
+check('re-importing the same event is a no-op, not a duplicate', () => {
+    assert.strictEqual(store.record(exported), false, 'event_id already present');
+    assert.strictEqual(store.record(Object.assign({}, exported)), false);
+    const {data} = store.query('api_top_pages', {
+        site_uuid: SITE, date_from: '2026-08-04', date_to: '2026-08-04', timezone: 'Etc/UTC'
+    });
+    assert.strictEqual(data[0].visits, 1, 'still one visit after three imports');
+});
+
+check('a zone-less timestamp is read as UTC, not as server-local time', () => {
+    // The whole point: on a server at UTC+2 the naive reading would file this
+    // 09:00 UTC hit at 07:00, and a late-evening hit on the previous day.
+    const {data} = store.query('api_kpis', {
+        site_uuid: SITE, date_from: '2026-08-04', date_to: '2026-08-04', timezone: 'Etc/UTC'
+    });
+    const active = data.filter(r => r.visits > 0);
+    assert.deepStrictEqual(active.map(r => r.date), ['2026-08-04 09:00:00']);
+});
+
+check('an event with no event_id still records', () => {
+    // Only the import path relies on event_id; a hit from an older tracker must
+    // not be silently dropped for lacking one.
+    const before = store.stats().hits;
+    hit('no-evt', '2026-08-04T10:00:00Z', {pathname: '/sans-id/'});
+    assert.strictEqual(store.stats().hits, before + 1);
+});
+
 check('every pipe Ghost is scoped to read is implemented', () => {
     // The list Ghost signs into its JWT — anything missing here would 404 in
     // the Admin rather than fail loudly at deploy time.
