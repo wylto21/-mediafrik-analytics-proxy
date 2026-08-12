@@ -97,10 +97,21 @@ function readSecret(envName, fileName, generate) {
     if (!generate) {
         throw new Error(`Missing ${envName} and ${fileName}`);
     }
-    // Regenerating on every boot would reset sessions on each deploy, so persist
-    // it. In a container without a volume, set SESSION_SECRET instead.
     const value = crypto.randomBytes(32).toString('hex');
-    fs.writeFileSync(file, value, {mode: 0o600});
+    // Regenerating on every boot would reset sessions on each deploy, so persist
+    // it when we can. In a container the application directory belongs to root
+    // while the process runs as an unprivileged user, so this write fails — and
+    // it must not be fatal: an ephemeral value is correct for the static bearer,
+    // which nothing needs to survive a restart. SESSION_SECRET is the one that
+    // genuinely matters, hence the louder warning.
+    try {
+        fs.writeFileSync(file, value, {mode: 0o600});
+    } catch (err) {
+        console.warn(`[config] cannot persist ${fileName} (${err.code}) — using a value generated at boot.`
+            + (envName === 'SESSION_SECRET'
+                ? ' Visitor sessions will reset on every restart; set SESSION_SECRET to a fixed value.'
+                : ` Set ${envName} to pin it.`));
+    }
     return value;
 }
 
