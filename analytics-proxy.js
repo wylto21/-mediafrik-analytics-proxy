@@ -45,6 +45,15 @@
  *   BATCH_INTERVAL_MS    how long a hit may wait to be relayed  (default 10000, 0 disables batching)
  *   BATCH_MAX_EVENTS     events per Tinybird request           (default 100)
  *   BATCH_MAX_BUFFER     events held while Tinybird is failing (default 5000)
+ *
+ * Local store (replaces Tinybird entirely — see analytics-store.js):
+ *   STORE_PATH           SQLite file; enables local ingest and pipe serving
+ *   STATS_TOKEN          bearer the Admin must present; falls back to ./.stats-token
+ *   TB_RELAY             'false' stops relaying to Tinybird
+ *
+ * The two can run together: with STORE_PATH set and relaying still on, every hit
+ * lands in both places, which is how you build local history before cutting over
+ * and how you verify the numbers agree.
  */
 
 const http = require('http');
@@ -56,6 +65,9 @@ const net = require('net');
 
 const PORT = Number(process.env.PORT || 3000);
 const BIND = process.env.BIND || '127.0.0.1';
+const STORE_PATH = process.env.STORE_PATH || '';
+const TB_RELAY = process.env.TB_RELAY !== 'false';
+const LOG_PIPES = process.env.LOG_PIPES !== 'false';
 const TB_HOST = process.env.TB_EVENTS_HOST || 'https://api.europe-west2.gcp.tinybird.co';
 const DATASOURCE = process.env.TB_DATASOURCE || 'analytics_events';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:2368';
@@ -92,8 +104,21 @@ function readSecret(envName, fileName, generate) {
     return value;
 }
 
-const TRACKER_TOKEN = readSecret('TB_TRACKER_TOKEN', '.tb-tracker-token', false);
+// Only required while we still relay: a store-only deployment has no Tinybird
+// account to authenticate against.
+const TRACKER_TOKEN = TB_RELAY ? readSecret('TB_TRACKER_TOKEN', '.tb-tracker-token', false) : '';
 const SESSION_SECRET = readSecret('SESSION_SECRET', '.session-secret', true);
+// Must match Ghost's `tinybird.stats.local.token`, which the Admin fetches from
+// /ghost/api/admin/tinybird/token/ and sends as a bearer.
+const STATS_TOKEN = STORE_PATH ? readSecret('STATS_TOKEN', '.stats-token', true) : '';
+// Must equal Ghost's `tinybird.adminToken` — it is the HMAC secret Ghost signs
+// the Admin's JWT with, so the two sides have to hold the same string. Kept in
+// its own file rather than reusing `.tb-admin-token`: that one is a live
+// Tinybird cloud credential, and a signing key for a service that no longer
+// talks to Tinybird has no business being the same string.
+const ADMIN_TOKEN = STORE_PATH ? readSecret('STATS_JWT_SECRET', '.stats-jwt-secret', true) : '';
+
+const store = STORE_PATH ? require('./analytics-store').openStore(STORE_PATH) : null;
 
 function ipToBytes(ip) {
     if (net.isIPv4(ip)) {
@@ -337,9 +362,147 @@ function retryLater(batch, reason) {
 
 function cors(res) {
     res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-site-uuid');
+    // GET and Authorization are for the pipe endpoints: the Admin reads them
+    // straight from the browser with the bearer it fetched from Ghost.
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, x-site-uuid');
     res.setHeader('Access-Control-Max-Age', '86400');
+}
+
+// Constant-time compare so a wrong token cannot be discovered a byte at a time.
+function tokenMatches(presented) {
+    if (!STATS_TOKEN) {
+        return false;
+    }
+    const a = Buffer.from(String(presented || ''));
+    const b = Buffer.from(STATS_TOKEN);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Verifies the JWT Ghost mints for the Admin.
+ *
+ * Ghost signs it with the configured `adminToken` as the HMAC secret and puts a
+ * per-pipe scope list inside (`tinybird-service.js`), each scope pinning the
+ * site_uuid the holder may read. Checking the signature here is what lets the
+ * endpoint be exposed publicly: a token is only good for the pipes it names, for
+ * the site it names, until it expires.
+ *
+ * Ghost's *local* mode was the obvious-looking alternative, but the Admin does
+ * not send any credential for several pipes in that mode — it assumes an
+ * unauthenticated local container — so those requests arrive bare and the charts
+ * come back empty. The JWT path is the one Ghost uses against Tinybird proper,
+ * and it authenticates every call.
+ */
+function b64urlToBuffer(part) {
+    return Buffer.from(String(part).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+}
+
+function verifyJwt(token) {
+    if (!ADMIN_TOKEN) {
+        return null;
+    }
+    const parts = String(token).split('.');
+    if (parts.length !== 3) {
+        return null;
+    }
+    const [header, payload, signature] = parts;
+
+    const expected = crypto.createHmac('sha256', ADMIN_TOKEN).update(`${header}.${payload}`).digest();
+    const presented = b64urlToBuffer(signature);
+    if (presented.length !== expected.length || !crypto.timingSafeEqual(presented, expected)) {
+        return null;
+    }
+
+    let claims;
+    try {
+        claims = JSON.parse(b64urlToBuffer(payload).toString('utf8'));
+    } catch (err) {
+        return null;
+    }
+    if (typeof claims.exp === 'number' && claims.exp * 1000 < Date.now()) {
+        return null;
+    }
+    return claims;
+}
+
+// A scope authorises one pipe, and carries the site_uuid the holder is confined
+// to. Ghost lists both the plain and _v2 names, so an exact match is enough.
+function scopeFor(claims, pipeName) {
+    const scopes = Array.isArray(claims.scopes) ? claims.scopes : [];
+    return scopes.find(scope => scope && scope.resource === pipeName) || null;
+}
+
+function servePipe(req, res) {
+    const url = new URL(req.url, 'http://localhost');
+    const pipeName = decodeURIComponent(url.pathname.slice('/v0/pipes/'.length).replace(/\.json$/, ''));
+
+    // Tinybird accepts the token either as a bearer or as a `token` query
+    // parameter, and the Admin uses the query parameter — so supporting only
+    // the header makes every chart in the dashboard come back empty.
+    const auth = String(req.headers.authorization || '');
+    const presented = auth.startsWith('Bearer ') ? auth.slice(7).trim() : (url.searchParams.get('token') || '');
+
+    const params = Object.fromEntries(url.searchParams.entries());
+    // Not a query parameter — it is the credential, and passing it through
+    // would leave it in the pipe's params.
+    delete params.token;
+
+    // The static token stays valid for curl and the test suite; the Admin
+    // presents a JWT.
+    let claims = null;
+    if (!tokenMatches(presented)) {
+        claims = presented ? verifyJwt(presented) : null;
+        const scope = claims && scopeFor(claims, pipeName);
+        if (!scope) {
+            console.error(`[pipes] 403 ${pipeName} — ${!presented ? 'no Authorization header' : claims ? 'token not scoped for this pipe' : 'bad signature or expired'}`);
+            res.writeHead(403, {'Content-Type': 'application/json'});
+            res.end(JSON.stringify({error: 'invalid token'}));
+            return;
+        }
+        // The scope pins the tenant. Honour it over the query string, so a
+        // valid token cannot be pointed at another site by editing the URL.
+        const pinned = scope.fixed_params && scope.fixed_params.site_uuid;
+        if (pinned) {
+            params.site_uuid = pinned;
+        }
+    }
+
+    // What the Admin actually asks for is the one thing that cannot be guessed
+    // from this side; log it so a mismatch shows up as a line rather than a
+    // silently empty chart.
+    if (LOG_PIPES) {
+        // Redacted: the token travels in the query string, and a log file is
+        // not a place to keep working credentials.
+        console.log(`[pipes] ${req.method} ${pipeName} ${url.search.replace(/token=[^&]*/, 'token=…')}`);
+    }
+
+    if (!params.site_uuid) {
+        res.writeHead(400, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({error: 'site_uuid is required'}));
+        return;
+    }
+
+    let result;
+    try {
+        result = store.query(pipeName, params);
+    } catch (err) {
+        console.error(`[pipes] ${pipeName} failed: ${err.stack || err.message}`);
+        res.writeHead(500, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({error: err.message}));
+        return;
+    }
+
+    if (!result) {
+        // Same shape Tinybird uses for an unknown pipe, so the Admin degrades
+        // the way it already knows how instead of failing opaquely.
+        res.writeHead(404, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({error: `Pipe '${pipeName}' not found`}));
+        return;
+    }
+
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify(result));
 }
 
 const server = http.createServer((req, res) => {
@@ -355,11 +518,25 @@ const server = http.createServer((req, res) => {
             ok: true,
             datasource: DATASOURCE,
             host: TB_HOST,
+            relay: TB_RELAY,
             queued: queue.length,
             dropped,
             // Non-zero while Tinybird is refusing us — quota or an outage.
-            retryInSeconds: Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000))
+            retryInSeconds: Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000)),
+            store: store ? Object.assign({path: STORE_PATH}, store.stats()) : null
         }));
+        return;
+    }
+    // Tinybird answers pipes on both verbs; the Admin posts, Ghost's server-side
+    // stats service gets. Drain the body on POST — the Admin puts every
+    // parameter in the query string, but an unread stream keeps the socket open.
+    if (store && (req.method === 'GET' || req.method === 'POST') && req.url.startsWith('/v0/pipes/')) {
+        if (req.method === 'POST') {
+            req.resume();
+            req.on('end', () => servePipe(req, res));
+        } else {
+            servePipe(req, res);
+        }
         return;
     }
     if (req.method !== 'POST' || !req.url.startsWith('/api/v1/page_hit')) {
@@ -407,13 +584,29 @@ const server = http.createServer((req, res) => {
         res.writeHead(202, {'Content-Type': 'application/json'});
         res.end(JSON.stringify({ok: true}));
 
-        enqueue(enriched);
+        if (store) {
+            // A malformed hit must not take the process down after the response
+            // has already gone out — log it and keep serving.
+            try {
+                store.record(enriched);
+            } catch (err) {
+                console.error(`[store] insert failed: ${err.message}`);
+            }
+        }
+        if (TB_RELAY) {
+            enqueue(enriched);
+        }
     });
 });
 
 server.listen(PORT, BIND, () => {
     console.log(`analytics-proxy listening on http://${BIND}:${PORT}`);
-    console.log(`  relaying to ${TB_HOST}/v0/events?name=${DATASOURCE}`);
+    if (store) {
+        console.log(`  serving pipes from ${STORE_PATH} (${store.stats().hits} hit(s) stored)`);
+    }
+    console.log(TB_RELAY
+        ? `  relaying to ${TB_HOST}/v0/events?name=${DATASOURCE}`
+        : '  Tinybird relay disabled');
     console.log(`  accepting origin ${ALLOWED_ORIGIN}`);
     console.log(`  trusting X-Forwarded-For from ${TRUSTED_PROXY_CIDRS.join(', ')} (${XFF_TRUST_HOPS} hop)`);
     console.log(BATCH_INTERVAL_MS
@@ -438,6 +631,11 @@ async function shutdown() {
     }
     if (queue.length) {
         console.error(`[relay] exiting with ${queue.length} unsent event(s)`);
+    }
+    if (store) {
+        // Checkpoints the WAL, so the database file is complete on disk rather
+        // than only complete once a later process replays the journal.
+        store.close();
     }
     process.exit(0);
 }

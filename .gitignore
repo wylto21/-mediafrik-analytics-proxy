@@ -1,0 +1,15 @@
+# Secrets are read from the environment in production and from these files in
+# development. Neither belongs in a public repository.
+.tb-tracker-token
+.tb-admin-token
+.session-secret
+.stats-token
+.stats-jwt-secret
+
+# The local analytics store and its write-ahead log.
+*.db
+*.db-wal
+*.db-shm
+
+*.log
+node_modules/
